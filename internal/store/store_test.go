@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -69,8 +70,11 @@ func TestConfirmWithinDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse deadline %q: %v", w.Deadline, err)
 	}
-	if got := deadline.Sub(opened); got != WindowTTLSeconds*time.Second {
-		t.Fatalf("deadline - opened_at = %v, want %v", got, WindowTTLSeconds*time.Second)
+	if got := deadline.Sub(opened); got != DefaultWindowTTLSeconds*time.Second {
+		t.Fatalf("deadline - opened_at = %v, want %v", got, DefaultWindowTTLSeconds*time.Second)
+	}
+	if w.TTLSeconds != DefaultWindowTTLSeconds {
+		t.Fatalf("ttl_seconds snapshot = %d, want %d", w.TTLSeconds, DefaultWindowTTLSeconds)
 	}
 
 	done, err := st.ConfirmWindow(ctx, "STER-01")
@@ -338,5 +342,307 @@ func TestUnknownDevice(t *testing.T) {
 	}
 	if _, err := st.GetDevice(ctx, "NOPE"); !errors.Is(err, ErrDeviceNotFound) {
 		t.Fatalf("get unknown device = %v, want ErrDeviceNotFound", err)
+	}
+}
+
+// 策略快照语义：未配置设备用默认 30 秒；配置后新窗口采用新时限；再次改策
+// 不回改活动窗口（deadline 与 ttl_seconds 快照均不变）；活动窗口关闭后
+// 登记的下一个窗口采用最新策略。
+func TestPolicySnapshotSemantics(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	mustDevice(t, st, "STER-P1")
+
+	// 未配置：默认策略。
+	p, err := st.GetDevicePolicy(ctx, "STER-P1")
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if p.TTLSeconds != DefaultWindowTTLSeconds || p.Source != PolicySourceDefault || p.UpdatedAt != nil {
+		t.Fatalf("default policy = %+v, want ttl=%d source=default updated_at=nil",
+			p, DefaultWindowTTLSeconds)
+	}
+	w0 := mustWindow(t, st, "STER-P1")
+	if w0.TTLSeconds != DefaultWindowTTLSeconds {
+		t.Fatalf("default window ttl_seconds = %d, want %d", w0.TTLSeconds, DefaultWindowTTLSeconds)
+	}
+	if _, err := st.ConfirmWindow(ctx, "STER-P1"); err != nil {
+		t.Fatalf("confirm default window: %v", err)
+	}
+
+	// 配置 10 秒：新窗口采用新时限。
+	p, err = st.SetDevicePolicy(ctx, "STER-P1", 10)
+	if err != nil {
+		t.Fatalf("set policy 10: %v", err)
+	}
+	if p.TTLSeconds != 10 || p.Source != PolicySourceCustom || p.UpdatedAt == nil {
+		t.Fatalf("custom policy = %+v, want ttl=10 source=custom updated_at set", p)
+	}
+	w1 := mustWindow(t, st, "STER-P1")
+	assertWindowTTL(t, w1, 10)
+
+	// 再次改策为 600 秒：活动窗口 w1 的 deadline 与快照不得改变。
+	if _, err := st.SetDevicePolicy(ctx, "STER-P1", MaxWindowTTLSeconds); err != nil {
+		t.Fatalf("set policy 600: %v", err)
+	}
+	cur, err := st.GetWindow(ctx, w1.ID)
+	if err != nil {
+		t.Fatalf("get active window: %v", err)
+	}
+	if cur.TTLSeconds != 10 || cur.Deadline != w1.Deadline || cur.State != StateOpen {
+		t.Fatalf("active window changed after policy update: %+v, want ttl=10 deadline=%q open",
+			cur, w1.Deadline)
+	}
+	// 当前策略查询反映最新配置。
+	p, err = st.GetDevicePolicy(ctx, "STER-P1")
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if p.TTLSeconds != MaxWindowTTLSeconds || p.Source != PolicySourceCustom {
+		t.Fatalf("policy = %+v, want ttl=%d source=custom", p, MaxWindowTTLSeconds)
+	}
+
+	// 活动窗口仍在 10 秒时限内，确认成功。
+	done, err := st.ConfirmWindow(ctx, "STER-P1")
+	if err != nil {
+		t.Fatalf("confirm w1: %v", err)
+	}
+	if done.State != StateConfirmed || done.TTLSeconds != 10 {
+		t.Fatalf("confirmed window = %+v, want confirmed ttl=10", done)
+	}
+
+	// 下一个窗口采用最新策略 600 秒。
+	w2 := mustWindow(t, st, "STER-P1")
+	assertWindowTTL(t, w2, MaxWindowTTLSeconds)
+}
+
+// assertWindowTTL 断言窗口快照了 want 秒时限，且 deadline = opened_at + want。
+func assertWindowTTL(t *testing.T, w Window, want int) {
+	t.Helper()
+	if w.TTLSeconds != want {
+		t.Fatalf("window %d ttl_seconds = %d, want %d", w.ID, w.TTLSeconds, want)
+	}
+	opened, err := time.Parse(time.RFC3339Nano, w.OpenedAt)
+	if err != nil {
+		t.Fatalf("parse opened_at %q: %v", w.OpenedAt, err)
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, w.Deadline)
+	if err != nil {
+		t.Fatalf("parse deadline %q: %v", w.Deadline, err)
+	}
+	if got := deadline.Sub(opened); got != time.Duration(want)*time.Second {
+		t.Fatalf("window %d deadline - opened_at = %v, want %v", w.ID, got, time.Duration(want)*time.Second)
+	}
+}
+
+// 策略校验：越界值返回 ErrInvalidPolicyTTL 且不留下半写入配置；未知设备
+// 返回 ErrDeviceNotFound；边界值 1 与 600 合法。
+func TestSetDevicePolicyValidation(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	mustDevice(t, st, "STER-P2")
+
+	for _, ttl := range []int{0, -1, 601, 1 << 30} {
+		if _, err := st.SetDevicePolicy(ctx, "STER-P2", ttl); !errors.Is(err, ErrInvalidPolicyTTL) {
+			t.Fatalf("set policy %d = %v, want ErrInvalidPolicyTTL", ttl, err)
+		}
+	}
+	// 越界写入不得留下任何配置：仍为默认策略。
+	p, err := st.GetDevicePolicy(ctx, "STER-P2")
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if p.TTLSeconds != DefaultWindowTTLSeconds || p.Source != PolicySourceDefault {
+		t.Fatalf("policy after rejected writes = %+v, want default %d", p, DefaultWindowTTLSeconds)
+	}
+
+	for _, ttl := range []int{MinWindowTTLSeconds, MaxWindowTTLSeconds} {
+		if _, err := st.SetDevicePolicy(ctx, "STER-P2", ttl); err != nil {
+			t.Fatalf("set boundary policy %d: %v", ttl, err)
+		}
+	}
+	// 最后一次成功写入生效。
+	p, err = st.GetDevicePolicy(ctx, "STER-P2")
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if p.TTLSeconds != MaxWindowTTLSeconds || p.Source != PolicySourceCustom {
+		t.Fatalf("policy = %+v, want ttl=%d source=custom", p, MaxWindowTTLSeconds)
+	}
+	// 越界更新不得破坏已有配置。
+	if _, err := st.SetDevicePolicy(ctx, "STER-P2", 0); !errors.Is(err, ErrInvalidPolicyTTL) {
+		t.Fatalf("set policy 0 = %v, want ErrInvalidPolicyTTL", err)
+	}
+	p, err = st.GetDevicePolicy(ctx, "STER-P2")
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if p.TTLSeconds != MaxWindowTTLSeconds || p.Source != PolicySourceCustom {
+		t.Fatalf("policy after failed update = %+v, want ttl=%d source=custom", p, MaxWindowTTLSeconds)
+	}
+
+	if _, err := st.SetDevicePolicy(ctx, "NOPE", 30); !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("set policy on unknown device = %v, want ErrDeviceNotFound", err)
+	}
+	if _, err := st.GetDevicePolicy(ctx, "NOPE"); !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("get policy on unknown device = %v, want ErrDeviceNotFound", err)
+	}
+}
+
+// 既有数据库迁移：旧 schema（unload_windows 无 ttl_seconds 列、无
+// device_policies 表）的库文件在 Open 后自动补列建表，存量窗口回填默认
+// 时限，新登记与策略功能正常。
+func TestOpenMigratesLegacyDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// 用上线前的旧 schema 建库并写入存量数据。
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	_, err = raw.ExecContext(ctx, `
+		CREATE TABLE devices (
+		    id         TEXT PRIMARY KEY,
+		    name       TEXT NOT NULL,
+		    created_at TEXT NOT NULL
+		);
+		CREATE TABLE unload_windows (
+		    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		    device_id    TEXT NOT NULL REFERENCES devices(id),
+		    state        TEXT NOT NULL CHECK (state IN ('open', 'confirmed', 'quarantined')),
+		    opened_at    TEXT NOT NULL,
+		    deadline     TEXT NOT NULL,
+		    closed_at    TEXT,
+		    close_reason TEXT
+		);
+		CREATE UNIQUE INDEX ux_unload_windows_open_device
+		    ON unload_windows (device_id) WHERE state = 'open';
+		INSERT INTO devices (id, name, created_at)
+		    VALUES ('LEGACY', 'legacy sterilizer', '2026-01-01T00:00:00.000Z');
+		INSERT INTO unload_windows (device_id, state, opened_at, deadline, closed_at, close_reason)
+		    VALUES ('LEGACY', 'confirmed',
+		            '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:30.000Z',
+		            '2026-01-01T00:00:05.000Z', 'door_open_confirmed');`)
+	if err != nil {
+		t.Fatalf("seed legacy db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// 存量窗口回填默认时限 30 秒。
+	legacy, err := st.GetWindow(ctx, 1)
+	if err != nil {
+		t.Fatalf("get legacy window: %v", err)
+	}
+	if legacy.TTLSeconds != DefaultWindowTTLSeconds {
+		t.Fatalf("legacy window ttl_seconds = %d, want backfilled %d",
+			legacy.TTLSeconds, DefaultWindowTTLSeconds)
+	}
+	if legacy.State != StateConfirmed {
+		t.Fatalf("legacy window state = %q, want %q", legacy.State, StateConfirmed)
+	}
+
+	// 新登记窗口快照默认时限；策略功能在迁移后的库上正常。
+	w := mustWindow(t, st, "LEGACY")
+	assertWindowTTL(t, w, DefaultWindowTTLSeconds)
+	if _, err := st.SetDevicePolicy(ctx, "LEGACY", 45); err != nil {
+		t.Fatalf("set policy on migrated db: %v", err)
+	}
+	p, err := st.GetDevicePolicy(ctx, "LEGACY")
+	if err != nil {
+		t.Fatalf("get policy on migrated db: %v", err)
+	}
+	if p.TTLSeconds != 45 || p.Source != PolicySourceCustom {
+		t.Fatalf("policy = %+v, want ttl=45 source=custom", p)
+	}
+
+	// 重复打开已迁移的库是空操作（模拟进程重启）。
+	st2, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	st2.Close()
+}
+
+// 并发迁移：api 与 worker 两进程可能同时启动并打开同一个旧库，
+// 两边的 Open 都必须成功（重复列迁移被识别为已完成）。
+func TestConcurrentOpenMigratesLegacyDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-race.db")
+
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	_, err = raw.ExecContext(ctx, `
+		CREATE TABLE devices (
+		    id         TEXT PRIMARY KEY,
+		    name       TEXT NOT NULL,
+		    created_at TEXT NOT NULL
+		);
+		CREATE TABLE unload_windows (
+		    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		    device_id    TEXT NOT NULL REFERENCES devices(id),
+		    state        TEXT NOT NULL CHECK (state IN ('open', 'confirmed', 'quarantined')),
+		    opened_at    TEXT NOT NULL,
+		    deadline     TEXT NOT NULL,
+		    closed_at    TEXT,
+		    close_reason TEXT
+		);
+		CREATE UNIQUE INDEX ux_unload_windows_open_device
+		    ON unload_windows (device_id) WHERE state = 'open';
+		INSERT INTO devices (id, name, created_at)
+		    VALUES ('LEGACY-RACE', 'legacy sterilizer', '2026-01-01T00:00:00.000Z');`)
+	if err != nil {
+		t.Fatalf("seed legacy db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	const n = 4
+	stores := make([]*Store, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range stores {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			stores[i], errs[i] = Open(ctx, path)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent open %d: %v", i, err)
+		}
+	}
+	defer func() {
+		for _, st := range stores {
+			if st != nil {
+				st.Close()
+			}
+		}
+	}()
+
+	// 迁移恰好发生一次：列存在，且每个打开者都能正常使用策略与登记。
+	w, err := stores[0].RegisterWindow(ctx, "LEGACY-RACE")
+	if err != nil {
+		t.Fatalf("register after concurrent migrate: %v", err)
+	}
+	assertWindowTTL(t, w, DefaultWindowTTLSeconds)
+	if _, err := stores[n-1].SetDevicePolicy(ctx, "LEGACY-RACE", 20); err != nil {
+		t.Fatalf("set policy after concurrent migrate: %v", err)
 	}
 }

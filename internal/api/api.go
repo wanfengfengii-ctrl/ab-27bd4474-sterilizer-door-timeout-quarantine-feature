@@ -1,5 +1,5 @@
 // Package api 提供面向消毒供应中心设备集成的 HTTP 接口：
-// 登记卸载窗口、接收开门确认、查询设备/窗口状态。
+// 登记卸载窗口、接收开门确认、查询设备/窗口状态、更新设备卸载时限策略。
 // 所有状态裁决都下沉到 store 层的 SQLite 原子语句，本层只做
 // 参数校验、错误映射与 JSON 序列化。
 package api
@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -44,6 +45,7 @@ func NewServer(st *store.Store) *Server {
 	r.GET("/health", s.health)
 	r.POST("/devices", s.createDevice)
 	r.GET("/devices/:deviceID/status", s.deviceStatus)
+	r.PUT("/devices/:deviceID/policy", s.updateDevicePolicy)
 	r.POST("/devices/:deviceID/windows", s.registerWindow)
 	r.POST("/devices/:deviceID/confirm", s.confirmWindow)
 	return s
@@ -124,6 +126,87 @@ func rejectClientFields(c *gin.Context) error {
 		strings.Join(slices.Sorted(maps.Keys(payload)), ", "))
 }
 
+// parsePolicyPayload 解析并校验策略更新请求体：必须是仅含 ttl_seconds 字段
+// 的 JSON 对象，且值为 [MinWindowTTLSeconds, MaxWindowTTLSeconds] 内的整数。
+// 值缺失、非整数（含字符串、布尔、null、浮点）或越界都返回参数错误。
+func parsePolicyPayload(c *gin.Context) (int, error) {
+	rangeHint := fmt.Sprintf("an integer between %d and %d",
+		store.MinWindowTTLSeconds, store.MaxWindowTTLSeconds)
+	if c.Request.Body == nil {
+		return 0, fmt.Errorf("request body must be a JSON object with ttl_seconds (%s)", rangeHint)
+	}
+	dec := json.NewDecoder(c.Request.Body)
+	dec.UseNumber()
+	var payload map[string]any
+	if err := dec.Decode(&payload); err != nil {
+		return 0, fmt.Errorf("request body must be a JSON object with ttl_seconds (%s)", rangeHint)
+	}
+	raw, ok := payload["ttl_seconds"]
+	if !ok {
+		return 0, fmt.Errorf("missing required field ttl_seconds (%s)", rangeHint)
+	}
+	if len(payload) != 1 {
+		extra := make([]string, 0, len(payload)-1)
+		for k := range payload {
+			if k != "ttl_seconds" {
+				extra = append(extra, k)
+			}
+		}
+		slices.Sort(extra)
+		return 0, fmt.Errorf("unexpected field(s) %s: only ttl_seconds is accepted", strings.Join(extra, ", "))
+	}
+	num, ok := raw.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("ttl_seconds must be %s, got %v", rangeHint, raw)
+	}
+	n, err := strconv.ParseInt(num.String(), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ttl_seconds must be %s, got %v", rangeHint, num)
+	}
+	if n < store.MinWindowTTLSeconds || n > store.MaxWindowTTLSeconds {
+		return 0, fmt.Errorf("ttl_seconds %d out of range: must be %s", n, rangeHint)
+	}
+	return int(n), nil
+}
+
+// updateDevicePolicy 处理 PUT /devices/{id}/policy：集成工程师提交 1–600 秒
+// 的整数开门确认时限。更新是单条原子 UPSERT：失败不会留下半写入配置，
+// 也不会改动设备已登记的窗口。策略值缺失、非整数或越界返回 400 结构化
+// 参数错误；设备不存在返回 404。
+func (s *Server) updateDevicePolicy(c *gin.Context) {
+	deviceID := c.Param("deviceID")
+	ttl, err := parsePolicyPayload(c)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest, err.Error(),
+			map[string]any{
+				"field": "ttl_seconds",
+				"min":   store.MinWindowTTLSeconds,
+				"max":   store.MaxWindowTTLSeconds,
+			})
+		return
+	}
+
+	p, err := s.st.SetDevicePolicy(c.Request.Context(), deviceID, ttl)
+	switch {
+	case errors.Is(err, store.ErrDeviceNotFound):
+		writeError(c, http.StatusNotFound, CodeDeviceNotFound,
+			fmt.Sprintf("device %q not found", deviceID), nil)
+	case errors.Is(err, store.ErrInvalidPolicyTTL):
+		writeError(c, http.StatusBadRequest, CodeInvalidRequest,
+			fmt.Sprintf("ttl_seconds must be an integer between %d and %d",
+				store.MinWindowTTLSeconds, store.MaxWindowTTLSeconds),
+			map[string]any{
+				"field": "ttl_seconds",
+				"min":   store.MinWindowTTLSeconds,
+				"max":   store.MaxWindowTTLSeconds,
+			})
+	case err != nil:
+		writeError(c, http.StatusInternalServerError, CodeInternal, "failed to update device policy", nil)
+	default:
+		c.JSON(http.StatusOK, gin.H{"policy": p})
+	}
+}
+
 func (s *Server) registerWindow(c *gin.Context) {
 	deviceID := c.Param("deviceID")
 	if err := rejectClientFields(c); err != nil {
@@ -192,13 +275,21 @@ func (s *Server) deviceStatus(c *gin.Context) {
 		return
 	}
 
+	// 当前生效策略与最近窗口采用的时限快照一并返回，调用方据此解释
+	// 截止时刻的来源（策略的后续变化不回改已登记窗口）。
+	p, err := s.st.GetDevicePolicy(c.Request.Context(), deviceID)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, CodeInternal, "failed to query device policy", nil)
+		return
+	}
+
 	w, err := s.st.LatestWindow(c.Request.Context(), deviceID)
 	switch {
 	case errors.Is(err, store.ErrWindowNotFound):
-		c.JSON(http.StatusOK, gin.H{"device": d, "window": nil})
+		c.JSON(http.StatusOK, gin.H{"device": d, "policy": p, "window": nil})
 	case err != nil:
 		writeError(c, http.StatusInternalServerError, CodeInternal, "failed to query window", nil)
 	default:
-		c.JSON(http.StatusOK, gin.H{"device": d, "window": w})
+		c.JSON(http.StatusOK, gin.H{"device": d, "policy": p, "window": w})
 	}
 }
