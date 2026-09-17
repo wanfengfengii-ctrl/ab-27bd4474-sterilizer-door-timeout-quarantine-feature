@@ -1,8 +1,9 @@
 # CSSD 灭菌柜卸载窗口裁决服务
 
 面向消毒供应中心（CSSD）设备集成的纯后端服务。灭菌柜结束程序后，设备必须在
-限定窗口（30 秒）内完成开门确认；确认请求与超时扫描几乎同时到达时，系统对
-同一窗口只形成一个稳定的终态：`confirmed`（正常卸载）或 `quarantined`（隔离）。
+确认时限内完成开门确认：时限按设备策略配置（1–600 秒），未配置的设备使用
+默认 30 秒。确认请求与超时扫描几乎同时到达时，系统对同一窗口只形成一个稳定
+的终态：`confirmed`（正常卸载）或 `quarantined`（隔离）。
 
 ## 架构
 
@@ -10,13 +11,13 @@
 
 ```
                 ┌─────────────┐
-  设备/集成方 ──▶│  api (Gin)  │──┐  登记窗口 / 开门确认 / 查询
+  设备/集成方 ──▶│  api (Gin)  │──┐  登记窗口 / 开门确认 / 查询 / 策略更新
                 └─────────────┘  │        ┌──────────────────┐
                                  ├───────▶│  SQLite (WAL)    │
                 ┌─────────────┐  │        │  devices         │
-                │   worker    │──┘        │  unload_windows  │
-                └─────────────┘           └──────────────────┘
-                 周期扫描到期窗口
+                │   worker    │──┘        │  device_policies │
+                └─────────────┘           │  unload_windows  │
+                 周期扫描到期窗口            └──────────────────┘
 ```
 
 - `cmd/api`：HTTP API，登记卸载窗口、接收开门确认、查询状态。
@@ -40,6 +41,24 @@
 
 `open` 是唯一非终态；终态之后不存在任何迁移。
 
+## 卸载时限策略
+
+确认时限按设备策略确定，规则如下：
+
+- 集成工程师通过 `PUT /devices/{id}/policy` 提交 `{"ttl_seconds": N}`，
+  `N` 为 1–600 的整数；重复提交覆盖旧值。缺失字段、非整数（含字符串、
+  小数）或越界都返回 `400 INVALID_REQUEST`（`error.details` 指明字段与
+  原因），设备不存在返回 `404 DEVICE_NOT_FOUND`。更新是单条 UPSERT，
+  失败不会留下半写入配置，也不影响该设备已登记的任何窗口。
+- 未配置策略的设备没有策略行，继续使用默认 30 秒。
+- **登记窗口时**，同一条 INSERT 读取设备当前策略、以数据库 UTC 当前时间
+  生成 `deadline = now + 采用的秒数`，并把采用的秒数快照到窗口的
+  `ttl_seconds`。策略后续变化不会改动已登记窗口——活动窗口仍按原截止
+  时刻裁决，只有之后登记的窗口采用新策略。
+- 设备状态查询同时返回当前生效策略（`policy.source` 为 `configured` 或
+  `default`）与最近窗口快照的 `ttl_seconds`，调用方可据此解释截止时刻
+  的来源。
+
 ## UTC 时间边界规则
 
 所有参与裁决的时刻**一律取自数据库自身的 UTC 当前时间**，客户端与应用进程
@@ -47,9 +66,10 @@
 
 - 时间由 SQLite 的 `strftime('%Y-%m-%dT%H:%M:%fZ','now')` 生成，UTC、毫秒
   精度，形如 `2026-09-15T00:19:26.197Z`；定长格式下字符串字典序即时间序。
-- **登记**：`deadline = 数据库 UTC now + 30 秒`，与 `opened_at` 在同一条
-  INSERT 内生成。客户端不得指定截止时刻——登记/确认接口拒绝任何请求字段
-  （返回 `400 INVALID_REQUEST`）。
+- **登记**：`deadline = 数据库 UTC now + 采用的时限`（设备策略值，未配置时
+  默认 30 秒），与 `opened_at` 在同一条 INSERT 内生成，采用的秒数同时快照
+  到窗口的 `ttl_seconds`。客户端不得指定截止时刻——登记/确认接口拒绝任何
+  请求字段（返回 `400 INVALID_REQUEST`）。
 - **确认**：单条 UPDATE 内取数据库时间 `now`：
   - `now < deadline`（严格早于）→ 写入 `confirmed`，原因 `door_open_confirmed`；
   - `now >= deadline`（等于或晚于）→ 写入 `quarantined`，原因 `confirm_after_deadline`。
@@ -78,11 +98,12 @@
 |------|------|------|------|----------|
 | GET | `/health` | 健康检查（含数据库连通性） | 200 | 503 |
 | POST | `/devices` | 登记设备 `{device_id, name}` | 201 | 409 `DEVICE_ALREADY_EXISTS` |
+| PUT | `/devices/{id}/policy` | 更新卸载时限策略 `{"ttl_seconds": 1-600}` | 200 | 404 `DEVICE_NOT_FOUND`、400 `INVALID_REQUEST` |
 | POST | `/devices/{id}/windows` | 登记卸载窗口（空请求体或 `{}`） | 201 | 404 `DEVICE_NOT_FOUND`、409 `WINDOW_ALREADY_OPEN`、400 `INVALID_REQUEST` |
 | POST | `/devices/{id}/confirm` | 开门确认（空请求体或 `{}`） | 200 | 404 `DEVICE_NOT_FOUND`、409 `NO_OPEN_WINDOW` |
-| GET | `/devices/{id}/status` | 查询设备及其最近窗口（无窗口时 `window` 为 `null`） | 200 | 404 `DEVICE_NOT_FOUND` |
+| GET | `/devices/{id}/status` | 查询设备、当前策略及最近窗口（无窗口时 `window` 为 `null`） | 200 | 404 `DEVICE_NOT_FOUND` |
 
-窗口对象：
+窗口对象（`ttl_seconds` 为登记时采用的时限快照）：
 
 ```json
 {
@@ -91,8 +112,21 @@
   "state": "open",
   "opened_at": "2026-09-15T00:19:26.197Z",
   "deadline":  "2026-09-15T00:19:56.197Z",
+  "ttl_seconds": 30,
   "closed_at": null,
   "close_reason": null
+}
+```
+
+策略对象（状态查询随 `policy` 返回；`source` 为 `configured` 或 `default`，
+`updated_at` 仅在 `configured` 时出现）：
+
+```json
+{
+  "device_id": "STER-DEMO",
+  "ttl_seconds": 45,
+  "source": "configured",
+  "updated_at": "2026-09-15T00:18:01.512Z"
 }
 ```
 
@@ -114,9 +148,11 @@
 curl -X POST localhost:8080/devices -H 'Content-Type: application/json' \
      -d '{"device_id":"STER-01","name":"灭菌柜 1"}'
 
-curl -X POST localhost:8080/devices/STER-01/windows          # 201，deadline 由数据库生成
+curl -X PUT  localhost:8080/devices/STER-01/policy -H 'Content-Type: application/json' \
+     -d '{"ttl_seconds":45}'                                 # 可选：更新卸载时限策略（默认 30 秒）
+curl -X POST localhost:8080/devices/STER-01/windows          # 201，deadline 由数据库按当前策略生成
 curl -X POST localhost:8080/devices/STER-01/confirm          # 200，confirmed 或 quarantined
-curl     localhost:8080/devices/STER-01/status               # 查询最终状态
+curl     localhost:8080/devices/STER-01/status               # 查询设备、当前策略与最终状态
 ```
 
 ## 配置
@@ -141,7 +177,9 @@ go run ./cmd/worker &    # 启动扫描 worker
 
 测试覆盖：及时确认、无人确认超时隔离、数据库时间恰好位于边界时确认与扫描
 的并发裁决（恰好一方提交终态且恒为 quarantined）、活动窗口冲突（含并发
-登记恰好一个成功），并通过查询断言唯一最终状态。
+登记恰好一个成功）、设备策略（默认 30 秒、更新后新窗口生效、已登记窗口
+快照不受改策影响、非法值拒绝且不留半写入配置、旧库迁移），并通过查询
+断言唯一最终状态。
 
 ## Docker Compose 运行
 
@@ -154,7 +192,9 @@ API_PORT=9090 docker compose up    # 覆盖宿主端口
 
 `verify` 位于独立 profile，不影响默认启动。它会等待 API 健康后执行完整
 验收（及时确认、30 秒超时隔离、活动窗口冲突、客户端禁止指定截止时刻、
-终态后重复确认），全部通过输出 `VERIFY: PASS` 并以退出码 0 结束：
+终态后重复确认，以及设备策略：默认 30 秒、更新后新窗口采用新时限、活动
+窗口不受改策影响、非法策略值与未知设备的结构化错误），全部通过输出
+`VERIFY: PASS` 并以退出码 0 结束：
 
 ```bash
 docker compose --profile verify up --build --abort-on-container-exit --exit-code-from verify

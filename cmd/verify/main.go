@@ -1,6 +1,8 @@
 // verify 是一次性验收客户端：对运行中的 API + worker 执行端到端验收，
-// 覆盖及时确认、无人确认超时隔离、活动窗口冲突、客户端禁止指定截止时刻
-// 以及终态后重复确认，全部通过则以退出码 0 结束。
+// 覆盖及时确认、无人确认超时隔离、活动窗口冲突、客户端禁止指定截止时刻、
+// 终态后重复确认，以及设备卸载时限策略（默认 30 秒、更新后新窗口生效、
+// 活动窗口不受改策影响、非法策略值被拒且不留半写入配置），全部通过则以
+// 退出码 0 结束。
 package main
 
 import (
@@ -20,8 +22,16 @@ type window struct {
 	State       string  `json:"state"`
 	OpenedAt    string  `json:"opened_at"`
 	Deadline    string  `json:"deadline"`
+	TTLSeconds  int     `json:"ttl_seconds"`
 	ClosedAt    *string `json:"closed_at"`
 	CloseReason *string `json:"close_reason"`
+}
+
+type policy struct {
+	DeviceID   string  `json:"device_id"`
+	TTLSeconds int     `json:"ttl_seconds"`
+	Source     string  `json:"source"`
+	UpdatedAt  *string `json:"updated_at"`
 }
 
 type checker struct {
@@ -87,6 +97,34 @@ func decodeStatus(data []byte) (*window, error) {
 	return resp.Window, nil
 }
 
+// decodeStatusFull 同时取出状态响应中的当前策略与最近窗口。
+func decodeStatusFull(data []byte) (*policy, *window, error) {
+	var resp struct {
+		Policy *policy `json:"policy"`
+		Window *window `json:"window"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, nil, err
+	}
+	if resp.Policy == nil {
+		return nil, nil, fmt.Errorf("response has no policy field: %s", data)
+	}
+	return resp.Policy, resp.Window, nil
+}
+
+func decodePolicy(data []byte) (policy, error) {
+	var resp struct {
+		Policy *policy `json:"policy"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return policy{}, err
+	}
+	if resp.Policy == nil {
+		return policy{}, fmt.Errorf("response has no policy field: %s", data)
+	}
+	return *resp.Policy, nil
+}
+
 func decodeErrCode(data []byte) string {
 	var resp struct {
 		Error struct {
@@ -140,6 +178,8 @@ func main() {
 	c.check("deadline assigned by database as opened_at + 30s",
 		oerr == nil && derr == nil && deadline.Sub(opened) == 30*time.Second,
 		fmt.Sprintf("opened_at=%q deadline=%q", w1.OpenedAt, w1.Deadline))
+	c.check("default device window snapshots ttl_seconds=30", w1.TTLSeconds == 30,
+		fmt.Sprintf("ttl_seconds=%d", w1.TTLSeconds))
 
 	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devA+"/confirm", map[string]any{})
 	cw, werr := decodeWindow(body)
@@ -212,6 +252,126 @@ func main() {
 	c.check("confirm after quarantine -> 409 NO_OPEN_WINDOW",
 		err == nil && status == http.StatusConflict && decodeErrCode(body) == "NO_OPEN_WINDOW",
 		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	// 场景 6：策略更新后新窗口使用新时限；状态查询同时暴露当前策略与窗口快照。
+	devD := "VERIFY-D-" + runID
+	c.doJSON(http.MethodPost, "/devices", map[string]any{"device_id": devD, "name": "Verify Sterilizer D"})
+	status, body, err = c.doJSON(http.MethodGet, "/devices/"+devD+"/status", nil)
+	pol, _, perr := decodeStatusFull(body)
+	c.check("fresh device reports default policy 30s",
+		err == nil && status == http.StatusOK && perr == nil && pol.TTLSeconds == 30 && pol.Source == "default",
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPut, "/devices/"+devD+"/policy", map[string]any{"ttl_seconds": 10})
+	pol2, perr2 := decodePolicy(body)
+	c.check("update policy to 10s", err == nil && status == http.StatusOK && perr2 == nil &&
+		pol2.TTLSeconds == 10 && pol2.Source == "configured" && pol2.UpdatedAt != nil,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devD+"/windows", map[string]any{})
+	wd, werr := decodeWindow(body)
+	openedD, oerrD := time.Parse(time.RFC3339Nano, wd.OpenedAt)
+	deadlineD, derrD := time.Parse(time.RFC3339Nano, wd.Deadline)
+	c.check("window after policy update uses new 10s limit",
+		err == nil && status == http.StatusCreated && werr == nil && wd.TTLSeconds == 10 &&
+			oerrD == nil && derrD == nil && deadlineD.Sub(openedD) == 10*time.Second,
+		fmt.Sprintf("status=%d err=%v ttl=%d opened_at=%q deadline=%q", status, err, wd.TTLSeconds, wd.OpenedAt, wd.Deadline))
+
+	status, body, err = c.doJSON(http.MethodGet, "/devices/"+devD+"/status", nil)
+	pol3, wdStatus, perr3 := decodeStatusFull(body)
+	c.check("status exposes current policy and window snapshot",
+		err == nil && status == http.StatusOK && perr3 == nil && pol3.TTLSeconds == 10 &&
+			wdStatus != nil && wdStatus.ID == wd.ID && wdStatus.TTLSeconds == 10,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devD+"/confirm", map[string]any{})
+	cwd, werr := decodeWindow(body)
+	c.check("confirm within new 10s window -> confirmed",
+		err == nil && status == http.StatusOK && werr == nil && cwd.State == "confirmed",
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	// 场景 7：活动窗口不受再次改策影响；下一个窗口才采用新策略。
+	devE := "VERIFY-E-" + runID
+	c.doJSON(http.MethodPost, "/devices", map[string]any{"device_id": devE, "name": "Verify Sterilizer E"})
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devE+"/windows", map[string]any{})
+	we, werr := decodeWindow(body)
+	c.check("register window E with default 30s", err == nil && status == http.StatusCreated && werr == nil && we.TTLSeconds == 30,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPut, "/devices/"+devE+"/policy", map[string]any{"ttl_seconds": 600})
+	c.check("update policy to 600s while window open", err == nil && status == http.StatusOK,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodGet, "/devices/"+devE+"/status", nil)
+	polE, weAfter, perrE := decodeStatusFull(body)
+	c.check("open window keeps original deadline and snapshot after policy change",
+		err == nil && status == http.StatusOK && perrE == nil && polE.TTLSeconds == 600 &&
+			weAfter != nil && weAfter.ID == we.ID && weAfter.TTLSeconds == 30 &&
+			weAfter.Deadline == we.Deadline && weAfter.State == "open",
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devE+"/confirm", map[string]any{})
+	cwe, werr := decodeWindow(body)
+	c.check("confirm still judged against original deadline -> confirmed",
+		err == nil && status == http.StatusOK && werr == nil && cwe.State == "confirmed" && cwe.TTLSeconds == 30,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devE+"/windows", map[string]any{})
+	we2, werr := decodeWindow(body)
+	openedE2, oerrE2 := time.Parse(time.RFC3339Nano, we2.OpenedAt)
+	deadlineE2, derrE2 := time.Parse(time.RFC3339Nano, we2.Deadline)
+	c.check("next window adopts updated 600s policy",
+		err == nil && status == http.StatusCreated && werr == nil && we2.TTLSeconds == 600 &&
+			oerrE2 == nil && derrE2 == nil && deadlineE2.Sub(openedE2) == 600*time.Second,
+		fmt.Sprintf("status=%d err=%v ttl=%d body=%s", status, err, we2.TTLSeconds, body))
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devE+"/confirm", map[string]any{})
+	c.check("confirm second window E -> confirmed",
+		err == nil && status == http.StatusOK, fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	// 场景 8：非法策略值返回结构化 400，未知设备返回 404；失败的更新不留下
+	// 半写入配置，也不影响已有窗口。
+	devF := "VERIFY-F-" + runID
+	c.doJSON(http.MethodPost, "/devices", map[string]any{"device_id": devF, "name": "Verify Sterilizer F"})
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devF+"/windows", map[string]any{})
+	wf, werr := decodeWindow(body)
+	c.check("register window F", err == nil && status == http.StatusCreated && werr == nil,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	badBodies := []struct {
+		name string
+		body map[string]any
+	}{
+		{"missing ttl_seconds", map[string]any{}},
+		{"float ttl_seconds", map[string]any{"ttl_seconds": 1.5}},
+		{"string ttl_seconds", map[string]any{"ttl_seconds": "30"}},
+		{"zero ttl_seconds", map[string]any{"ttl_seconds": 0}},
+		{"negative ttl_seconds", map[string]any{"ttl_seconds": -5}},
+		{"ttl_seconds above 600", map[string]any{"ttl_seconds": 601}},
+	}
+	for _, bad := range badBodies {
+		status, body, err = c.doJSON(http.MethodPut, "/devices/"+devF+"/policy", bad.body)
+		c.check("invalid policy rejected: "+bad.name,
+			err == nil && status == http.StatusBadRequest && decodeErrCode(body) == "INVALID_REQUEST",
+			fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+	}
+
+	status, body, err = c.doJSON(http.MethodPut, "/devices/VERIFY-NOPE-"+runID+"/policy", map[string]any{"ttl_seconds": 30})
+	c.check("policy update on unknown device -> 404 DEVICE_NOT_FOUND",
+		err == nil && status == http.StatusNotFound && decodeErrCode(body) == "DEVICE_NOT_FOUND",
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodGet, "/devices/"+devF+"/status", nil)
+	polF, wfAfter, perrF := decodeStatusFull(body)
+	c.check("rejected updates leave default policy and open window untouched",
+		err == nil && status == http.StatusOK && perrF == nil &&
+			polF.TTLSeconds == 30 && polF.Source == "default" &&
+			wfAfter != nil && wfAfter.ID == wf.ID && wfAfter.State == "open" &&
+			wfAfter.TTLSeconds == 30 && wfAfter.Deadline == wf.Deadline,
+		fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
+
+	status, body, err = c.doJSON(http.MethodPost, "/devices/"+devF+"/confirm", map[string]any{})
+	c.check("confirm window F -> confirmed",
+		err == nil && status == http.StatusOK, fmt.Sprintf("status=%d err=%v body=%s", status, err, body))
 
 	if c.failed > 0 {
 		fmt.Printf("VERIFY: FAIL (%d check(s) failed)\n", c.failed)
